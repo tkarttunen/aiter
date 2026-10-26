@@ -23,6 +23,12 @@ from ..jit.utils.mha_recipes import (
 )
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
+from .mha_fwd_policy import (
+    clear_mha_fwd_tuning_cache,  # noqa: F401  # re-exported
+    get_mha_fwd_tuned_backend,
+    record_mha_fwd_selection,
+    warn_declined_mha_fwd_row,
+)
 
 _FLYDSL_AVAILABLE = importlib.util.find_spec("flydsl") is not None
 
@@ -2937,6 +2943,7 @@ def _flash_attn_varlen_forward(
     out: torch.Tensor | None = None,
     zero_tensors: bool = False,
     sink_ptr: Tensor | None = None,
+    selected_backend: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     _, nhead_q, hdim_q = q.shape
     batch_size = cu_seqlens_q.numel() - 1
@@ -3068,7 +3075,29 @@ def _flash_attn_varlen_forward(
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
 
-    if can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen():
+    if (
+        selected_backend == "opus"
+        and not can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen()
+    ) or (
+        selected_backend == "asm_v3"
+        and not (can_impl_fmha_fwd_with_sink_varlen_asm() or can_impl_fmha_v3_fwd())
+    ):
+        warn_declined_mha_fwd_row(
+            selected_backend,
+            batch=batch_size,
+            max_seqlen_q=int(max_seqlen_q),
+            max_seqlen_k=int(max_seqlen_k),
+            nhead_q=nhead_q,
+            hdim_q=hdim_q,
+            hdim_v=hdim_v,
+        )
+        selected_backend = None
+
+    if (
+        selected_backend in (None, "opus")
+        and can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen()
+    ):
+        record_mha_fwd_selection("opus")
         # OPUS gfx950 group/varlen D=192 path. cu_seqlens_* are the REAL cumulative
         # lengths (masks / tile counts); cu_seqlens_*_padded are the PHYSICAL row
         # offsets (KV padding). When no padded arrays are given, physical == real.
@@ -3094,7 +3123,11 @@ def _flash_attn_varlen_forward(
         )
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
-    elif can_impl_fmha_fwd_with_sink_varlen_asm():
+    elif (
+        selected_backend in (None, "asm_v3")
+        and can_impl_fmha_fwd_with_sink_varlen_asm()
+    ):
+        record_mha_fwd_selection("asm_v3")
         # gfx1250 packed/varlen ASM bf16 path.  q/k/v are packed THD; the kernel
         # requires dense packing (the wrapper calls `.contiguous()` defensively)
         # and carries no strides.  softmax_scale is forwarded as-is (the kernel
@@ -3121,7 +3154,8 @@ def _flash_attn_varlen_forward(
         softmax_lse = lse_asm.squeeze(-1).transpose(0, 1).contiguous()
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
-    elif can_impl_fmha_v3_fwd():
+    elif selected_backend in (None, "asm_v3") and can_impl_fmha_v3_fwd():
+        record_mha_fwd_selection("asm_v3")
         out, softmax_lse, S_dmask, rng_state = fmha_v3_varlen_fwd(
             q,
             k,
@@ -3154,6 +3188,8 @@ def _flash_attn_varlen_forward(
             # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
     else:
+        record_mha_fwd_selection("ck")
+
         # Input validation for padded cumulative arrays if provided
         def _validate(name: str, t: torch.Tensor):
             assert t.dim() == 1, f"{name} must be 1D"
@@ -3488,6 +3524,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         q_descale=None,
         k_descale=None,
         v_descale=None,
+        selected_backend: str | None = None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -3528,6 +3565,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             block_table=block_table,
             out=out,
             sink_ptr=sink_ptr,
+            selected_backend=selected_backend,
         )
         if is_grad:
             assert return_lse
@@ -3664,6 +3702,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             None,  # q_descale
             None,  # k_descale
             None,  # v_descale
+            None,  # selected_backend
         )
 
 
@@ -3770,6 +3809,30 @@ def flash_attn_varlen_func(
         raise RuntimeError(
             "prequantized FP8 attention with descales requires ENABLE_CK=1"
         )
+    tuned_backend = get_mha_fwd_tuned_backend(
+        mode="varlen",
+        q=q,
+        k=k,
+        v=v,
+        batch=cu_seqlens_q.numel() - 1,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        min_seqlen_q=min_seqlen_q,
+        causal=causal,
+        window_size=window_size,
+        dropout_p=dropout_p,
+        logits_soft_cap=logits_soft_cap,
+        how_v3_bf16_cvt=how_v3_bf16_cvt,
+        return_lse=return_lse,
+        return_attn_probs=return_attn_probs,
+        bias=bias,
+        alibi_slopes=alibi_slopes,
+        sink_ptr=sink_ptr,
+        block_table=block_table,
+        q_descale=q_descale,
+        cu_seqlens_q_padded=cu_seqlens_q_padded,
+        cu_seqlens_k_padded=cu_seqlens_k_padded,
+    )
 
     # Try the PR3039 gfx1250 prefill ASM path before FlyDSL can claim it.
     def can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
@@ -3809,7 +3872,11 @@ def flash_attn_varlen_func(
             return sink_ptr is not None
         return sink_ptr is None
 
-    if not has_all_descales and can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
+    if (
+        not has_all_descales
+        and tuned_backend in (None, "asm_v3")
+        and can_try_gfx1250_fmha_fwd_with_sink_varlen_asm()
+    ):
         return FlashAttnVarlenFunc.apply(
             q,
             k,
@@ -3840,11 +3907,13 @@ def flash_attn_varlen_func(
             q_descale,
             k_descale,
             v_descale,
+            tuned_backend,
         )
 
     if (
         _FLYDSL_AVAILABLE
         and not has_all_descales
+        and tuned_backend in (None, "flydsl")
         and (len(window_size) < 3 or window_size[2] == 0)
         and cu_seqlens_q_padded is None
         and cu_seqlens_k_padded is None
@@ -3874,7 +3943,20 @@ def flash_attn_varlen_func(
             sink=sink_ptr,
         )
         if _flydsl_result is not None:
+            record_mha_fwd_selection("flydsl")
             return _flydsl_result
+    if tuned_backend == "flydsl":
+        # FlyDSL screens inputs the key does not carry (out's layout, install).
+        warn_declined_mha_fwd_row(
+            "flydsl",
+            batch=cu_seqlens_q.numel() - 1,
+            max_seqlen_q=int(max_seqlen_q),
+            max_seqlen_k=int(max_seqlen_k),
+            nhead_q=q.shape[-2],
+            hdim_q=q.shape[-1],
+            hdim_v=v.shape[-1],
+        )
+        tuned_backend = None
 
     if not ENABLE_CK:
         from .triton.attention.mha import (
@@ -3932,6 +4014,7 @@ def flash_attn_varlen_func(
         q_descale,
         k_descale,
         v_descale,
+        tuned_backend,
     )
 
 

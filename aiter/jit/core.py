@@ -267,6 +267,12 @@ AITER_CONFIG_MEGA_MOE_TP_BIGM = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/mega_moe_tp_bigm_tuned.csv",
 )
 
+# Exact hardware/problem keyed MHA forward runtime dispatch.
+AITER_CONFIG_MHA_FWD = os.getenv(
+    "AITER_CONFIG_MHA_FWD",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_mha_fwd.csv",
+)
+
 
 def model_config_files(tuned_file_name: str) -> list[str]:
     """Per-model tuned CSVs merged with the default one when no env var is set."""
@@ -468,6 +474,14 @@ class AITER_CONFIG:
         )
 
     @property
+    def AITER_CONFIG_MHA_FWD_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_MHA_FWD",
+            AITER_CONFIG_MHA_FWD,
+            "tuned_mha_fwd",
+        )
+
+    @property
     def AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
@@ -523,6 +537,9 @@ class AITER_CONFIG:
             keys.append("cu_num")
         if "gfx" in merge_df.columns and "gfx" not in keys:
             keys.append("gfx")
+        # gfx and cu_num cannot tell MI300X from MI325X.
+        if "gpu_model" in merge_df.columns and "gpu_model" not in keys:
+            keys.append("gpu_model")
         dedup_keys = keys + ["_tag"] if has_tag else keys
         # Only key on columns actually present in the merged frame. Most
         # families carry cu_num, but some (e.g. the mxscale batched-GEMM
