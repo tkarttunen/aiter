@@ -24,6 +24,7 @@ from ..jit.utils.mha_recipes import (
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 from .mha_fwd_policy import (
+    MHA_FWD_TRITON_BACKENDS,
     clear_mha_fwd_tuning_cache,  # noqa: F401  # re-exported
     get_mha_fwd_tuned_backend,
     record_mha_fwd_selection,
@@ -3958,12 +3959,14 @@ def flash_attn_varlen_func(
         )
         tuned_backend = None
 
-    if not ENABLE_CK:
+    if not ENABLE_CK or tuned_backend in MHA_FWD_TRITON_BACKENDS:
         from .triton.attention.mha import (
             flash_attn_varlen_func as flash_attn_varlen_func_triton,
         )
 
-        return flash_attn_varlen_func_triton(
+        if tuned_backend is not None:
+            record_mha_fwd_selection(tuned_backend)
+        result = flash_attn_varlen_func_triton(
             q=q,
             k=k,
             v=v,
@@ -3983,7 +3986,13 @@ def flash_attn_varlen_func(
             block_table=block_table,
             out=out,
             sink=sink_ptr,
+            backend=tuned_backend,
         )
+        # Triton returns a tensor of its own, while a CK caller reads out.
+        if tuned_backend is not None and out is not None and result is not out:
+            out.copy_(result)
+            return out
+        return result
     return FlashAttnVarlenFunc.apply(
         q,
         k,
