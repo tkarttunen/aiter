@@ -43,7 +43,11 @@ from flydsl.expr.typing import Vector as Vec
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.buffer_ops import create_buffer_resource_from_addr
-from aiter.ops.flydsl.kernels.kernels_common import ceildiv, format_kernel_name
+from aiter.ops.flydsl.kernels.kernels_common import (
+    ceildiv,
+    format_kernel_name,
+    set_slp_vectorize_once_used,
+)
 
 WAVE = 64
 MFMA_M = MFMA_N = 16
@@ -1121,3 +1125,6 @@ def launch_bmm_a8w8_mxscale(
         block=(threads, 1, 1),
         stream=stream,
     )
+
+
+set_slp_vectorize_once_used(launch_bmm_a8w8_mxscale, False)
